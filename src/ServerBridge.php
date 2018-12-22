@@ -146,7 +146,7 @@ class ServerBridge
                 $expectedCode=200;
                 $data=[];
             }
-            $response=$this->remoteServer->callApi($request, $data);
+            $response=$this->callApi($request, $data);
             $body=json_decode($response->getBody());
             if($response->getStatusCode()===$expectedCode) {
                 $requests[$name]=$body;
