@@ -14,7 +14,7 @@ class ServerBridge
     public function proxy(\Slim\Http\Request $request, \Slim\Http\Response $response, string $contentType=null, \Closure $callback=null):\Slim\Http\Response {
         $contentType=$contentType??$this->contentType;
         if($contentType!=='application/json' && $callback) {
-            throw new RemoteServerException('Callback can only be used with contentType application/json');
+            throw new ServerBridgeException('Callback can only be used with contentType application/json');
         }
         $method=$request->getMethod();
         $bodyParams=in_array($method,['PUT','POST'])?(array)$request->getParsedBody():[];   //Ignore body for GET and DELETE methods
@@ -104,7 +104,7 @@ class ServerBridge
                     return $response->withJson(json_decode($curlResponse->getBody()), $statusCode);
                 }
                 break;
-            default: throw new RemoteServerException("Invalid proxy contentType: $contentType");
+            default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
         }
     }
 
