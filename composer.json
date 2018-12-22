@@ -1,0 +1,22 @@
+{
+    "name": "greenbean/server-bridge",
+    "description": "Calling REST API and Slim/Guzzle proxy.",
+    "type": "project",
+    "authors": [
+        {
+            "name": "Michael Reed",
+            "email": "villascape@gmail.com"
+        }
+    ],
+    "require": {
+        "php": "^5.5 || ^7.0",
+        "slim/slim": "^3.0",
+        "guzzlehttp/guzzle": "^6.0"
+    },
+    "require-dev": {},
+    "autoload": {
+        "psr-4": {
+            "Greenbean\\ServerBridge\\":  "src/"
+        }
+    }
+}
