@@ -3,10 +3,11 @@ namespace Greenbean\ServerBridge;
 class ServerBridge
 {
 
-    protected $httpClient;
+    private $httpClient, $returnAsArray;
 
-    public function __construct(\GuzzleHttp\Client $httpClient){
+    public function __construct(\GuzzleHttp\Client $httpClient, bool $returnAsArray=false){
         $this->httpClient=$httpClient;
+        $this->returnAsArray=$returnAsArray;
     }
 
     public function proxy(\Slim\Http\Request $request, \Slim\Http\Response $response, \Closure $callback=null):\Slim\Http\Response {
@@ -63,7 +64,7 @@ class ServerBridge
             switch($contentType[0]) {
                 case "application/json;charset=utf-8":
                     //Application and server error messages will be returned.  Consider hiding server errors.
-                    $content=json_decode($curlResponse->getBody());
+                    $content=json_decode($curlResponse->getBody(), $this->returnAsArray);
                     if($callback) {
                         $content=$callback($content);
                     }
@@ -90,7 +91,7 @@ class ServerBridge
                         ->withBody($curlResponse->getBody());
                     }
                     else {
-                        return $response->withJson(json_decode($curlResponse->getBody()), $statusCode);
+                        return $response->withJson(json_decode($curlResponse->getBody(), false), $statusCode);
                     }
                     break;
                 default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
@@ -102,7 +103,7 @@ class ServerBridge
             syslog(LOG_ERR, 'Proxy error: '.$e->getMessage());
             if ($e->hasResponse()) {
                 $curlResponse=$e->getResponse();
-                return $response->withJson(json_decode($curlResponse->getBody()), $curlResponse->getStatusCode());
+                return $response->withJson(json_decode($curlResponse->getBody(), false), $curlResponse->getStatusCode());
             }
             else {
                 return $response->withJson($e->getMessage(), $e->getMessage());
@@ -153,14 +154,14 @@ class ServerBridge
                 //[\GuzzleHttp\Psr7\Request $request, array $data=[], array $options=[]] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
                 $defaultResults=$request[2]['defaultResults']??[];
                 $expectedCode=$request[2]['expectedCode']??200;
-                $returnAsArray=$request[2]['returnAsArray']??true;
+                $returnAsArray=$request[2]['returnAsArray']??$this->returnAsArray;
                 $data=$request[1]??[];
                 $request=$request[0];
             }
             elseif ($request instanceof \GuzzleHttp\Psr7\Request) {
                 $defaultResults=[];
                 $expectedCode=200;
-                $returnAsArray=true;
+                $returnAsArray=$this->returnAsArray;
                 $data=[];
             }
             else throw new ServerBridgeException("Invalid request to getPageContent: $name => ".json_encode($request));
