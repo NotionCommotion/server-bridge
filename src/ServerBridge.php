@@ -12,11 +12,10 @@ class ServerBridge
 
     public function proxy(\Slim\Http\Request $request, \Slim\Http\Response $response, \Closure $callback=null):\Slim\Http\Response {
         $method=$request->getMethod();
-        $bodyParams=in_array($method,['PUT','POST'])?(array)$request->getParsedBody():[];   //Ignore body for GET and DELETE methods
-        $queryParams=$request->getQueryParams();
-        $data=array_merge($queryParams, $bodyParams);   ///Would be better to write slim's body to guzzle's body so that get parameters are preserved and not overriden by body parameters.
-        $path=$request->getUri()->getPath();
+        $bodyParams=in_array($method,['PUT','POST'])?$request->getParsedBody():[];   //Ignore body for GET and DELETE methods?
         $contentType=$request->getContentType();
+        $options=[];
+
         if(substr($contentType, 0, 19)==='multipart/form-data'){
             //Support uploading a file.
             $files = $request->getUploadedFiles();
@@ -42,21 +41,28 @@ class ServerBridge
                     ];
                 }
             }
-            if($errors) return $response->withJson($errors, 422);
+            if($errors) return $response->withJson(['message'=>implode(', ', $errors)], 422);
             $multiparts[]=[
                 'name'=> 'data',
-                'contents' => json_encode($data),
+                'contents' => json_encode($bodyParams),
                 'headers'  => ['Content-Type' => 'application/json']
             ];
-            $options=['multipart' => $multiparts];
+            $options['multipart']=$multiparts;
         }
-        else {
-            $options = $data?(in_array($method,['PUT','POST'])?['json'=>$data]:['query'=>$data]):[];
+        elseif($bodyParams) {
+            $options['json']=$bodyParams;
         }
+
+        if($queryParams=$request->getQueryParams()) {
+            $options['query']=$queryParams;
+        }
+
+        $path=$request->getUri()->getPath();
         try {
             $curlResponse = $this->httpClient->request($method, $path, $options);
             $contentType=$curlResponse->getHeader('Content-Type');
             $statusCode=$curlResponse->getStatusCode();
+            $body=$curlResponse->getBody();
             if(count($contentType)!==1) {
                 syslog(LOG_ERR, 'contentType: '.json_encode($contentType));
                 throw new ServerBridgeException("Multiple contentTypes???: ".json_encode($contentType));
@@ -64,18 +70,22 @@ class ServerBridge
             switch($contentType[0]) {
                 case "application/json;charset=utf-8":
                     //Application and server error messages will be returned.  Consider hiding server errors.
-                    $content=json_decode($curlResponse->getBody(), $this->returnAsArray);
+                    $content=json_decode($body, $this->returnAsArray);
                     if($callback) {
                         $content=$callback($content);
                     }
                     return $response->withJson($content, $statusCode);
-                case 'text/html': case 'text/plain':   //Change to full name?
-                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json');
+                case 'text/html':
+                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json and text/plain');
+                case 'text/plain':   //Change to full name?
                     //Application and server error messages will be returned.  Consider hiding server errors.
+                    if($callback) {
+                        $body=$callback($body);
+                    }
                     $response = $response->withStatus($statusCode);
-                    return $response->getBody()->write($curlResponse->getBody());
+                    return $response->getBody()->write($body);
                 case 'application/octet-stream':
-                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json');
+                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json and text/plain');
                     if($statusCode===200) {
                         return $response
                         ->withHeader('Content-Type', $contentType)                                                      //application/octet-stream
@@ -88,10 +98,10 @@ class ServerBridge
                         //->withHeader('Content-Type', 'application/force-download')
                         //->withHeader('Content-Type', 'application/download')
                         //->withHeader('Content-Length', null)
-                        ->withBody($curlResponse->getBody());
+                        ->withBody($body);
                     }
                     else {
-                        return $response->withJson(json_decode($curlResponse->getBody(), false), $statusCode);
+                        return $response->withJson(json_decode($body, false), $statusCode);
                     }
                     break;
                 default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
@@ -111,7 +121,7 @@ class ServerBridge
         }
     }
 
-    public function callApi(\GuzzleHttp\Psr7\Request $request, array $data=[]):\GuzzleHttp\Psr7\Response {
+    public function callApi(\GuzzleHttp\Psr7\Request $request, array $data=[], array $bodyQuery=[]):\GuzzleHttp\Psr7\Response {
         try {
             if($data) {
                 if($this->isSequencialArray($data)) {
@@ -124,6 +134,7 @@ class ServerBridge
                 else {
                     //Will not work with files?
                     $data=['json'=>$data];
+                    if($bodyQuery) $data['query']=$bodyQuery;
                 }
             }
             $response = $this->httpClient->send($request, $data);
@@ -141,6 +152,7 @@ class ServerBridge
                 $response=$e->getResponse();
             }
             else {
+                //Untested
                 $response=new \GuzzleHttp\Psr7\Response($e->getCode(), [], $e->getMessage());
             }
         }
@@ -151,7 +163,8 @@ class ServerBridge
         $errors=[];
         foreach($requests as $name=>$request) {
             if(is_array($request)) {
-                //[\GuzzleHttp\Psr7\Request $request, array $data=[], array $options=[]] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
+                //[\GuzzleHttp\Psr7\Request $request, array $data=[], array $options=[], \Closure $callback=null] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
+                $callback=$request[3]??false;
                 $defaultResults=$request[2]['defaultResults']??[];
                 $expectedCode=$request[2]['expectedCode']??200;
                 $returnAsArray=$request[2]['returnAsArray']??$this->returnAsArray;
@@ -159,6 +172,7 @@ class ServerBridge
                 $request=$request[0];
             }
             elseif ($request instanceof \GuzzleHttp\Psr7\Request) {
+                $callback=false;
                 $defaultResults=[];
                 $expectedCode=200;
                 $returnAsArray=$this->returnAsArray;
@@ -168,11 +182,14 @@ class ServerBridge
             $response=$this->callApi($request, $data);
             $body=json_decode($response->getBody(), $returnAsArray);
             if($response->getStatusCode()===$expectedCode) {
+                if($callback) {
+                    $body=$callback($body);
+                }
                 $requests[$name]=$body;
             }
             else {
                 $requests[$name]=$defaultResults;
-                $errors[]=$returnAsArray?"$name: $body[message]":"$name: $body->message";
+                $errors[$name]=$returnAsArray?"$name: $body[message]":"$name: $body->message";
             }
         }
         if($errors) $requests['errors']=$errors;
@@ -181,6 +198,19 @@ class ServerBridge
 
     public function getConfig():array {
         return $this->httpClient->getConfig();
+    }
+
+    public function getConfigParam(array $path) {
+        //$path=['elem1', 'elem2'] => returns $config[$elem1]['elem2]
+        $config=$this->httpClient->getConfig();
+        $tmp=$this->config;
+        foreach($path as $key) {
+            if(!isset($config[$key])) {
+                throw new ServerBridgeException('Invalid path: '.implode('=>', $this->httpClient->getConfig()));
+            }
+            $config=$config[$key];
+        }
+        return $config;
     }
 
     public function getHost(bool $includeSchema=true):string {
