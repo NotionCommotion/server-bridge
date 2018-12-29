@@ -51,7 +51,7 @@ class ServerBridge
             $options['multipart']=$multiparts;
         }
         elseif($bodyParams) {
-            $options['json']=$bodyParams;
+            $options['json']=$bodyParams;   //Will be an array
         }
 
         if($queryParams=$httpRequest->getQueryParams()) {
@@ -62,7 +62,7 @@ class ServerBridge
         try {
             $curlResponse = $this->httpClient->request($method, $path, $options);
             $contentType=$curlResponse->getHeader('Content-Type');
-            if(count($contentType)!==1) {
+            if(count($contentType)>1) {
                 syslog(LOG_ERR, 'contentType: '.json_encode($contentType));
                 throw new ServerBridgeException("Multiple contentTypes???: ".json_encode($contentType));
             }
