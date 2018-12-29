@@ -61,16 +61,25 @@ class ServerBridge
         $path=$httpRequest->getUri()->getPath();
         try {
             $curlResponse = $this->httpClient->request($method, $path, $options);
-            $contentType=$curlResponse->getHeader('Content-Type');
-            if(count($contentType)>1) {
-                syslog(LOG_ERR, 'contentType: '.json_encode($contentType));
-                throw new ServerBridgeException("Multiple contentTypes???: ".json_encode($contentType));
-            }
-            $contentType=explode(';', $contentType[0]);
-            $contentEncoding=trim($contentType[1]??''); //Should anything be done with this?
-            $contentType=trim($contentType[0]);
             $statusCode=$curlResponse->getStatusCode();
             $body=$curlResponse->getBody();
+            if($contentType=$curlResponse->getHeader('Content-Type')) {
+                if(count($contentType)>1) {
+                    syslog(LOG_ERR, 'Multiple Content-Type???: '.json_encode($contentType));
+                }
+                $contentType=explode(';', $contentType[0]);
+                $contentEncoding=trim($contentType[1]??''); //Should anything be done with this?
+                $contentType=trim($contentType[0]);
+            }
+            else {
+                $contentType='none';
+                if($body) {
+                    syslog(LOG_ERR, 'No Content-Type but has body: '.json_encode($body));
+                }
+                if($statusCode!==203) {
+                    syslog(LOG_ERR, 'No Content-Type and status code not 203: '.$statusCode);
+                }
+            }
             switch($contentType) {
                 case "application/json":
                     //Application and server error messages will be returned.  Consider hiding server errors.
@@ -109,6 +118,9 @@ class ServerBridge
                         return $httpResponse->withJson(json_decode($body, false), $statusCode);
                     }
                     break;
+                case "none":
+                    //Returned for delete requests and other 203 responses.
+                    return $httpResponse->withJson(null, $statusCode);
                 case 'application/xml':
                     throw new ServerBridgeException("$contentType proxy contentType is not yet implemented");
                 default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
