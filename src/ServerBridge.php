@@ -73,12 +73,6 @@ class ServerBridge
             }
             else {
                 $contentType='none';
-                if($body) {
-                    syslog(LOG_ERR, 'No Content-Type but has body: '.json_encode($body));
-                }
-                if($statusCode!==203) {
-                    syslog(LOG_ERR, 'No Content-Type and status code not 203: '.$statusCode);
-                }
             }
             switch($contentType) {
                 case "application/json":
@@ -95,8 +89,8 @@ class ServerBridge
                     if($callback) {
                         $body=$callback($body);
                     }
-                    $httpResponse = $httpResponse->withStatus($statusCode);
-                    return $httpResponse->getBody()->write($body);
+                    $httpResponse->getBody()->write($body);
+                    return $httpResponse->withStatus($statusCode);
                 case 'application/octet-stream':
                     if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json and text/plain');
                     if($statusCode===200) {
@@ -119,8 +113,8 @@ class ServerBridge
                     }
                     break;
                 case "none":
-                    //Returned for delete requests and other 203 responses.
-                    return $httpResponse->withJson(null, $statusCode);
+                    //Returned for delete requests and other 204 responses.
+                    return $httpResponse->withStatus($statusCode);
                 case 'application/xml':
                     throw new ServerBridgeException("$contentType proxy contentType is not yet implemented");
                 default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
