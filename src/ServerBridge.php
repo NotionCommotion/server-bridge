@@ -3,184 +3,69 @@ namespace Greenbean\ServerBridge;
 class ServerBridge
 {
 
-    private $httpClient, $returnAsArray;
+    private $httpClient, $returnAsArray, $customMimeTypes, $standardMimeTypes=[
+        'csv'=>'text/csv',
+        'json'=>'application/json'
+    ];
 
-    public function __construct(\GuzzleHttp\Client $httpClient, bool $returnAsArray=true){
+    public function __construct(\GuzzleHttp\Client $httpClient, bool $returnAsArray=true, array $customMimeTypes=[]){
         $this->httpClient=$httpClient;  //Must be configured with default path
         $this->returnAsArray=$returnAsArray;
+        $this->customMimeTypes=$customMimeTypes;
     }
 
-    public function proxy(\Slim\Http\Request $httpRequest, \Slim\Http\Response $httpResponse, \Closure $callback=null):\Slim\Http\Response {
+    public function proxy(\Slim\Http\Request $slimRequest, \Slim\Http\Response $slimResponse, \Closure $errorHandler=null):\Slim\Http\Response {
         //Forwards Slim Request to another server and returns the updated Slim Response.
-        $method=$httpRequest->getMethod();
-        $bodyParams=in_array($method,['PUT','POST'])?$httpRequest->getParsedBody():[];   //Ignore body for GET and DELETE methods?
-        $contentType=$httpRequest->getContentType();
-        $options=[];
-
-        if(substr($contentType, 0, 19)==='multipart/form-data'){
-            //Support uploading a file.
-            $files = $httpRequest->getUploadedFiles();
-            $multiparts=[];
-            $errors=[];
-            foreach($files as $name=>$file) {
-                if ($error=$file->getError()) {
-                    $errors[]=[
-                        'name'=> $name,
-                        'filename'=> $file->getClientFilename(),
-                        'error' => $this->getFileErrorMessage($error)
-                    ];
-                }
-                else {
-                    $multiparts[]=[
-                        'name'=> $name,
-                        'filename'=> $file->getClientFilename(),
-                        'contents' => $file->getStream(),
-                        'headers'  => [
-                            //'Size' => $file->getSize(),   //Not needed, right?
-                            'Content-Type' => $file->getClientMediaType()
-                        ]
-                    ];
-                }
-            }
-            if($errors) return $httpResponse->withJson(['message'=>implode(', ', $errors)], 422);
-            $multiparts[]=[
-                'name'=> 'data',
-                'contents' => json_encode($bodyParams),
-                'headers'  => ['Content-Type' => 'application/json']
-            ];
-            $options['multipart']=$multiparts;
-        }
-        elseif($bodyParams) {
-            $options['json']=$bodyParams;   //Will be an array
-        }
-
-        if($queryParams=$httpRequest->getQueryParams()) {
-            $options['query']=$queryParams;
-        }
-
-        $path=$httpRequest->getUri()->getPath();
+        $slimRequest=$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)));  //Change slim's host to API server!
         try {
-            $curlResponse = $this->httpClient->request($method, $path, $options);
-            $statusCode=$curlResponse->getStatusCode();
-            $body=$curlResponse->getBody();
-            if($contentType=$curlResponse->getHeader('Content-Type')) {
-                if(count($contentType)>1) {
-                    syslog(LOG_ERR, 'Multiple Content-Type???: '.json_encode($contentType));
+            $guzzleResponse=$this->httpClient->send($slimRequest);
+            $excludedHeaders=['Date', 'Server', 'X-Powered-By', 'Access-Control-Allow-Origin', 'Access-Control-Allow-Methods', 'Access-Control-Allow-Headers'];
+            $headerArrays=array_diff_key($guzzleResponse->getHeaders(), array_flip($excludedHeaders));
+            foreach($headerArrays as $headerName=>$headers) {
+                foreach($headers as $headerValue) {
+                    $slimResponse=$slimResponse->withHeader($headerName, $headerValue);
                 }
-                $contentType=explode(';', $contentType[0]);
-                $contentEncoding=trim($contentType[1]??''); //Should anything be done with this?
-                $contentType=trim($contentType[0]);
             }
-            else {
-                $contentType='none';
-            }
-            switch($contentType) {
-                case "application/json":
-                    //Application and server error messages will be returned.  Consider hiding server errors.
-                    $content=json_decode($body, $this->returnAsArray);
-                    if($callback) {
-                        $content=$callback($content);
-                    }
-                    return $httpResponse->withJson($content, $statusCode);
-                case 'text/html':
-                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json and text/plain');
-                case 'text/plain':
-                    //Application and server error messages will be returned.  Consider hiding server errors.
-                    if($callback) {
-                        $body=$callback($body);
-                    }
-                    $httpResponse->getBody()->write($body);
-                    return $httpResponse->withStatus($statusCode);
-                case 'application/octet-stream':
-                    if($callback) throw new ServerBridgeException('Callback can only be used with contentType application/json and text/plain');
-                    if($statusCode===200) {
-                        return $httpResponse
-                        ->withHeader('Content-Type', $contentType)                                                      //application/octet-stream
-                        ->withHeader('Content-Description', $curlResponse->getHeader('Content-Description'))            //File Transfer
-                        ->withHeader('Content-Transfer-Encoding', $curlResponse->getHeader('Content-Transfer-Encoding'))//binary
-                        ->withHeader('Content-Disposition', $curlResponse->getHeader('Content-Disposition'))            //"attachment; filename='filename.ext'"
-                        ->withHeader('Expires', $curlResponse->getHeader('Expires'))                                    //0
-                        ->withHeader('Cache-Control', $curlResponse->getHeader('Cache-Control'))                        //must-revalidate, post-check=0, pre-check=0
-                        ->withHeader('Pragma', $curlResponse->getHeader('Pragma'))                                      //public
-                        //->withHeader('Content-Type', 'application/force-download')                                    //Confirm not desired
-                        //->withHeader('Content-Type', 'application/download')                                          //Confirm not desired
-                        //->withHeader('Content-Length', null)                                                          //Confirm not desired
-                        //->withHeader('Some-Other-Header', 'foo')                                                      //Confirm no other headers needed
-                        ->withBody($body);
-                    }
-                    else {
-                        return $httpResponse->withJson(json_decode($body, false), $statusCode);
-                    }
-                    break;
-                case "none":
-                    //Returned for delete requests and other 204 responses.
-                    return $httpResponse->withStatus($statusCode);
-                case 'application/xml':
-                    throw new ServerBridgeException("$contentType proxy contentType is not yet implemented");
-                default: throw new ServerBridgeException("Invalid proxy contentType: $contentType");
-            }
+            return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
-            //Errors only return JSON
-            //Networking error which includes ConnectException and TooManyRedirectsException
-            syslog(LOG_ERR, 'Proxy error: '.$e->getMessage());
             if ($e->hasResponse()) {
-                $curlResponse=$e->getResponse();
-                return $httpResponse->withJson(json_decode($curlResponse->getBody(), false), $curlResponse->getStatusCode());
+                $guzzleResponse=$e->getResponse();
+                $body=$errorHandler?$errorHandler($guzzleResponse->getBody()):$guzzleResponse->getBody();
+                return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($body);
             }
             else {
-                return $httpResponse->withJson($e->getMessage(), $e->getMessage());
+                return $slimResponse->withStatus(500)->write(json_encode(['message'=>'RequestException without response: '.$e->getMessage()]));
             }
         }
     }
 
-    public function callApi(\GuzzleHttp\Psr7\Request $curlRequest, array $data=[], array $bodyQuery=[]):\GuzzleHttp\Psr7\Response {
+    public function callApi(\GuzzleHttp\Psr7\Request $curlRequest, array $data=[]):\GuzzleHttp\Psr7\Response {
         //Submits a single Guzzle Request and returns the Guzzle Response.
-        //$bodyQuery only needed for requests with data in both the body and url, and will likely be never used.
         try {
             if($data) {
-                if($this->isSequencialArray($data)) {
-                    throw new ServerBridgeException('getPageContent(): Invalid data. Must be an associated array');
-                }
-                if(in_array($curlRequest->getMethod(), ['GET','DELETE'])){
-                    //$data=['query'=>$this->isMultiArray($data)?http_build_query($data):$data];
-                    $data=['query'=>$data];
-                }
-                else {
-                    //Will not work with files?
-                    $data=['json'=>$data];
-                    if($bodyQuery) $data['query']=$bodyQuery;
-                }
+                $data=[in_array($curlRequest->getMethod(), ['GET','DELETE'])?'query':'json'=>$data];
             }
             $curlResponse = $this->httpClient->send($curlRequest, $data);
         }
-        catch (\GuzzleHttp\Exception\ClientException $e) {
-            $curlResponse=$e->getResponse();
-        }
-        catch (\GuzzleHttp\Exception\ServerException $e) {
-            //Consider not including all information back to client
-            $curlResponse=$e->getResponse();
-        }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
-            //Networking error which includes ConnectException and TooManyRedirectsException
-            if ($e->hasResponse()) {
-                $curlResponse=$e->getResponse();
-            }
-            else {
-                //Untested
-                $curlResponse=new \GuzzleHttp\Psr7\Response($e->getCode(), [], $e->getMessage());
-            }
+            $curlResponse=$e->hasResponse()
+            ?$e->getResponse()
+            :new \GuzzleHttp\Psr7\Response($e->getCode(), [], $e->getMessage());    //Untested
         }
         return $curlResponse;
     }
 
     public function getPageContent(array $curlRequests):array {
         //Helper function which receives multiple Guzzle Requests which will populate a given webpage.
+        //Each element in the array will either be a Guzzle Request or an array with a Guzzle Request and other options.
+        //Errors only support having a message in the response unless $errorCallback is provided.
         $errors=[];
         $curlResponses=[];
         foreach($curlRequests as $name=>$curlRequest) {
             if(is_array($curlRequest)) {
-                //[\GuzzleHttp\Psr7\Request $curlRequest, array $data=[], array $options=[], \Closure $callback=null] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
+                //[\GuzzleHttp\Psr7\Request $curlRequest, array $data=[], array $options=[], \Closure $callback=null, \Closure $errorCallback=null] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
+                $errorCallback=$curlRequest[4]??false;
                 $callback=$curlRequest[3]??false;
                 $defaultResults=$curlRequest[2]['defaultResults']??[];
                 $expectedCode=$curlRequest[2]['expectedCode']??200;
@@ -205,12 +90,25 @@ class ServerBridge
                 $curlResponses[$name]=$body;
             }
             else {
+                if($errorCallback) {
+                    $body=$errorCallback($body);
+                }
+                $curlResponses[$name]=$body;
                 $curlResponses[$name]=$defaultResults;
                 $errors[$name]=$returnAsArray?"$name: $body[message]":"$name: $body->message";
             }
         }
         if($errors) $curlResponses['errors']=$errors;
         return $curlResponses;
+    }
+
+    public function getMimeType($type) {
+        syslog(LOG_INFO, json_encode(debug_backtrace()));
+        if(empty($type)) throw new ServerBridgeException("Missing Accept value.");
+        $a=array_merge($this->standardMimeTypes, $this->customMimeTypes);
+        if(!isset($a[$type]))
+            throw new ServerBridgeException("Invalid Accept value: $type");
+        return $a[$type];
     }
 
     public function getConfig():array {
@@ -233,6 +131,36 @@ class ServerBridge
     public function getHost(bool $includeSchema=true):string {
         $baseUri=$this->httpClient->getConfig()['base_uri'];
         return $includeSchema?$baseUri->getScheme().'://'.$baseUri->getHost():$baseUri->getHost();
+    }
+
+    private function getBestSupportedMimeType($mimeTypes = null) {
+        //Not used.  What is the purpose?
+        // Values will be stored in this array
+        $AcceptTypes = [];
+        $accept = strtolower(str_replace(' ', '', $_SERVER['HTTP_ACCEPT']));
+        $accept = explode(',', $accept);
+        foreach ($accept as $a) {
+            $q = 1;  // the default quality is 1.
+            // check if there is a different quality
+            if (strpos($a, ';q=')) {
+                // divide "mime/type;q=X" into two parts: "mime/type" i "X"
+                list($a, $q) = explode(';q=', $a);
+            }
+            // mime-type $a is accepted with the quality $q
+            // WARNING: $q == 0 means, that mime-type isn’t supported!
+            $AcceptTypes[$a] = $q;
+        }
+        arsort($AcceptTypes);
+
+        // if no parameter was passed, just return parsed data
+        if (!$mimeTypes) return $AcceptTypes;
+
+        //If supported mime-type exists, return it, else return null
+        $mimeTypes = array_map('strtolower', (array)$mimeTypes);
+        foreach ($AcceptTypes as $mime => $q) {
+            if ($q && in_array($mime, $mimeTypes)) return $mime;
+        }
+        return null;
     }
 
     private function getFileErrorMessage($code){
@@ -264,6 +192,14 @@ class ServerBridge
                 break;
         }
         return $message;
+    }
+
+    public function logDebug(\GuzzleHttp\Psr7\Response $response):array {
+        return [
+            'body'=>(string) $response->getBody(),
+            'status'=>$response->getStatusCode(),
+            'headers'=>$response->getHeaders()
+        ];
     }
 
     private function isSequencialArray($array){
