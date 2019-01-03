@@ -8,17 +8,43 @@ class ServerBridge
         'json'=>'application/json'
     ];
 
-    public function __construct(\GuzzleHttp\Client $httpClient, bool $returnAsArray=true, array $customMimeTypes=[]){
+    public function __construct(\GuzzleHttp\Client $httpClient, array $customMimeTypes=[], bool $returnAsArray=true){
         $this->httpClient=$httpClient;  //Must be configured with default path
-        $this->returnAsArray=$returnAsArray;
         $this->customMimeTypes=$customMimeTypes;
+        $this->returnAsArray=$returnAsArray;
     }
 
-    public function proxy(\Slim\Http\Request $slimRequest, \Slim\Http\Response $slimResponse, \Closure $errorHandler=null):\Slim\Http\Response {
+    public function proxy(\Slim\Http\Request $slimRequest, \Slim\Http\Response $slimResponse):\Slim\Http\Response {
         //Forwards Slim Request to another server and returns the updated Slim Response.
+        $body=$slimRequest->getBody();
+        if((string) $body && !$contentType=$slimRequest->getMediaType()) {
+            json_decode($slimRequest->getBody());
+            //Guzzle doesn't appear to like the full content type which includes: charset=utf-8
+            $contentType=json_last_error()?'application/x-www-form-urlencoded':'application/json';
+        }
+
         $slimRequest=$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)));  //Change slim's host to API server!
         try {
+            /*
+            //If desired, can change body to JSON and change Content-Type
+            if (($contentType=$slimRequest->getMediaType()) && $contentType!=='application/json') {
+            //Change body to JSON if not currently done
+            $slimRequest->getBody()->write(json_encode($slimRequest->getParsedBody()));
+            $slimRequest->reparseBody();
+            $slimRequest=$slimRequest->withHeader('Content-Type', 'application/json;charset=utf-8');
+            $slimRequest->reparseBody();
+            syslog(LOG_INFO, 'string2: '.(string) $slimRequest->getBody());
+            }
+            Or maybe make a new guzzleRequest?
+            $guzzleRequest=(new \GuzzleHttp\Psr7\Request($slimRequest->getMethod(), $slimRequest->getUri()->getPath()))->withBody($slimRequest->getBody());
+            $headers=array_intersect_key($slimRequest->getHeaders(), array_flip(['CONTENT_LENGTH', 'CONTENT_TYPE']));
+            foreach($headers as $name=>$value) {
+            $guzzleRequest=$guzzleRequest->withHeader($this->getHeaderName($name), $value);
+            }
+            syslog(LOG_INFO, 'proxy $guzzleRequest->getHeaders(): '.json_encode($guzzleRequest->getHeaders()));
             $guzzleResponse=$this->httpClient->send($slimRequest);
+            */
+            $guzzleResponse=$this->httpClient->send(isset($contentType)?$slimRequest->withHeader('Content-Type', $contentType):$slimRequest);
             $excludedHeaders=['Date', 'Server', 'X-Powered-By', 'Access-Control-Allow-Origin', 'Access-Control-Allow-Methods', 'Access-Control-Allow-Headers'];
             $headerArrays=array_diff_key($guzzleResponse->getHeaders(), array_flip($excludedHeaders));
             foreach($headerArrays as $headerName=>$headers) {
@@ -31,79 +57,92 @@ class ServerBridge
         catch (\GuzzleHttp\Exception\RequestException  $e) {
             if ($e->hasResponse()) {
                 $guzzleResponse=$e->getResponse();
-                $body=$errorHandler?$errorHandler($guzzleResponse->getBody()):$guzzleResponse->getBody();
-                return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($body);
+                if($this->isJson($guzzleResponse)) {
+                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
+                }
+                else {
+                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->write(json_encode(['message'=>(string)$guzzleResponse->getBody()]));
+                }
             }
             else {
-                return $slimResponse->withStatus(500)->write(json_encode(['message'=>'RequestException without response: '.$e->getMessage()]));
+                return $slimResponse->withStatus(500)->write(json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));
             }
         }
     }
 
-    public function callApi(\GuzzleHttp\Psr7\Request $curlRequest, array $data=[]):\GuzzleHttp\Psr7\Response {
+    public function callApi(\GuzzleHttp\Psr7\Request $guzzleRequest, array $data=[]):\GuzzleHttp\Psr7\Response {
         //Submits a single Guzzle Request and returns the Guzzle Response.
+        if($data) {
+            $data=[in_array($guzzleRequest->getMethod(), ['GET','DELETE'])?'query':'json'=>$data];
+        }
         try {
-            if($data) {
-                $data=[in_array($curlRequest->getMethod(), ['GET','DELETE'])?'query':'json'=>$data];
-            }
-            $curlResponse = $this->httpClient->send($curlRequest, $data);
+            return $this->httpClient->send($guzzleRequest, $data);
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
-            $curlResponse=$e->hasResponse()
-            ?$e->getResponse()
-            :new \GuzzleHttp\Psr7\Response($e->getCode(), [], $e->getMessage());    //Untested
+            if ($e->hasResponse()) {
+                $guzzleResponse=$e->getResponse();
+                if($this->isJson($guzzleResponse)) {
+                    return $guzzleResponse;
+                }
+                else {
+                    return $guzzleResponse->withBody(\GuzzleHttp\Psr7\stream_for(json_encode(['message'=>(string)$guzzleResponse->getBody()])));
+                }
+            }
+            else {
+                syslog(LOG_ERR, "ServerBridge::callApi() RequestException without response: {$this->getExceptionMessage($e)}");
+                return new \GuzzleHttp\Psr7\Response(500, [], json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));    //Untested
+            }
         }
-        return $curlResponse;
     }
 
-    public function getPageContent(array $curlRequests):array {
+    public function getPageContent(array $pageItems):array {
         //Helper function which receives multiple Guzzle Requests which will populate a given webpage.
         //Each element in the array will either be a Guzzle Request or an array with a Guzzle Request and other options.
-        //Errors only support having a message in the response unless $errorCallback is provided.
         $errors=[];
-        $curlResponses=[];
-        foreach($curlRequests as $name=>$curlRequest) {
-            if(is_array($curlRequest)) {
-                //[\GuzzleHttp\Psr7\Request $curlRequest, array $data=[], array $options=[], \Closure $callback=null, \Closure $errorCallback=null] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
-                $errorCallback=$curlRequest[4]??false;
-                $callback=$curlRequest[3]??false;
-                $defaultResults=$curlRequest[2]['defaultResults']??[];
-                $expectedCode=$curlRequest[2]['expectedCode']??200;
-                $returnAsArray=$curlRequest[2]['returnAsArray']??$this->returnAsArray;
-                $data=$curlRequest[1]??[];
-                $curlRequest=$curlRequest[0];
+        foreach($pageItems as $name=>$guzzleRequest) {
+            if(is_array($guzzleRequest)) {
+                //[\GuzzleHttp\Psr7\Request $guzzleRequest, array $data=[], array $options=[], \Closure $callback=null, \Closure $errorCallback=null] where options: int expectedCode, mixed $defaultResults, bool returnAsArray
+                $callback=$guzzleRequest[3]??false;
+                $defaultResults=$guzzleRequest[2]['defaultResults']??[];
+                $expectedCode=$guzzleRequest[2]['expectedCode']??200;
+                $returnAsArray=$guzzleRequest[2]['returnAsArray']??$this->returnAsArray;
+                $data=$guzzleRequest[1]??[];
+                $guzzleRequest=$guzzleRequest[0];
             }
-            elseif ($curlRequest instanceof \GuzzleHttp\Psr7\Request) {
+            elseif ($guzzleRequest instanceof \GuzzleHttp\Psr7\Request) {
                 $callback=false;
                 $defaultResults=[];
                 $expectedCode=200;
                 $returnAsArray=$this->returnAsArray;
                 $data=[];
             }
-            else throw new ServerBridgeException("Invalid request to getPageContent: $name => ".json_encode($curlRequest));
-            $curlResponse=$this->callApi($curlRequest, $data);
-            $body=json_decode($curlResponse->getBody(), $returnAsArray);
-            if($curlResponse->getStatusCode()===$expectedCode) {
+            else {
+                throw new ServerBridgeException("Invalid request to getPageContent: $name => ".json_encode($guzzleRequest));
+            }
+
+            $guzzleResponse=$this->callApi($guzzleRequest, $data);
+            if($guzzleResponse->getStatusCode()===$expectedCode) {
+                $data=json_decode($guzzleResponse->getBody(), $returnAsArray);
                 if($callback) {
-                    $body=$callback($body);
+                    $data=$callback($data);
                 }
-                $curlResponses[$name]=$body;
+                $pageItems[$name]=$data;
             }
             else {
-                if($errorCallback) {
-                    $body=$errorCallback($body);
-                }
-                $curlResponses[$name]=$body;
-                $curlResponses[$name]=$defaultResults;
-                $errors[$name]=$returnAsArray?"$name: $body[message]":"$name: $body->message";
+                $data=json_decode($guzzleResponse->getBody());
+                $pageItems[$name]=$defaultResults;
+                $errors[$name]=$data->message;
             }
         }
-        if($errors) $curlResponses['errors']=$errors;
-        return $curlResponses;
+        if($errors) {
+            foreach($errors as $name=>$error) {
+                $pageItems['errors'][]="$name: $error";
+            }
+        }
+        return $pageItems;
     }
 
-    public function getMimeType($type) {
-        syslog(LOG_INFO, json_encode(debug_backtrace()));
+    public function getMimeType(string $type):string {
         if(empty($type)) throw new ServerBridgeException("Missing Accept value.");
         $a=array_merge($this->standardMimeTypes, $this->customMimeTypes);
         if(!isset($a[$type]))
@@ -131,6 +170,30 @@ class ServerBridge
     public function getHost(bool $includeSchema=true):string {
         $baseUri=$this->httpClient->getConfig()['base_uri'];
         return $includeSchema?$baseUri->getScheme().'://'.$baseUri->getHost():$baseUri->getHost();
+    }
+
+    public function debug(\GuzzleHttp\Psr7\Response $response):array {
+        return [
+            'body'=>(string) $response->getBody(),
+            'status'=>$response->getStatusCode(),
+            'headers'=>$response->getHeaders()
+        ];
+    }
+
+    private function getHeaderName(string $name):string {
+        //Not currently used.
+        $parts=explode('_', $name);
+        foreach($parts as &$part) $part=ucfirst(strtolower($part));
+        return implode('-',$parts);
+    }
+
+    private function isJson(\GuzzleHttp\Psr7\Response $guzzleResponse):bool {
+        $contentType=$guzzleResponse->getHeader('Content-Type');
+        return in_array('application/json;charset=utf-8', $contentType)||in_array('application/json', $contentType);
+    }
+
+    private function getExceptionMessage(\Exception $e) : string {
+        return $e->getMessage().' ('.$e->getCode().')';
     }
 
     private function getBestSupportedMimeType($mimeTypes = null) {
@@ -163,7 +226,7 @@ class ServerBridge
         return null;
     }
 
-    private function getFileErrorMessage($code){
+    private function getFileErrorMessage(int $code):string{
         switch ($code) {
             case UPLOAD_ERR_INI_SIZE:
                 $message = "The uploaded file exceeds the upload_max_filesize directive in php.ini";
@@ -194,19 +257,11 @@ class ServerBridge
         return $message;
     }
 
-    public function logDebug(\GuzzleHttp\Psr7\Response $response):array {
-        return [
-            'body'=>(string) $response->getBody(),
-            'status'=>$response->getStatusCode(),
-            'headers'=>$response->getHeaders()
-        ];
-    }
-
-    private function isSequencialArray($array){
+    private function isSequencialArray(array $array):bool{
         return (array_values($array) === $array);
     }
 
-    private function isMultiArray($array){
+    private function isMultiArray(array $array):bool{
         return count($array) !== count($array, COUNT_RECURSIVE);
         //If needing to detect empty array ['bla'=>[]], use the following
         foreach ($array as $v) {
