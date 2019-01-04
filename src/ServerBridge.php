@@ -3,48 +3,46 @@ namespace Greenbean\ServerBridge;
 class ServerBridge
 {
 
-    private $httpClient, $returnAsArray, $customMimeTypes, $standardMimeTypes=[
+    private $httpClient, $returnAsArray=true, $debug=false, $debugAsJson=true, $customMimeTypes, $standardMimeTypes=[
         'csv'=>'text/csv',
         'json'=>'application/json'
     ];
 
-    public function __construct(\GuzzleHttp\Client $httpClient, array $customMimeTypes=[], bool $returnAsArray=true){
+    public function __construct(\GuzzleHttp\Client $httpClient, array $customMimeTypes=[], array $options=[]){
+        //Options: returnAsArray: true as array, false as stdClass, debug: true/false, debugJson: true as json, false as var_dump
         $this->httpClient=$httpClient;  //Must be configured with default path
         $this->customMimeTypes=$customMimeTypes;
-        $this->returnAsArray=$returnAsArray;
+        if($extra=array_diff_key($options, array_flip(['returnAsArray', 'debug', 'debugAsJson']))) {
+            throw new ServerBridgeException('Following options are not allowed: '.implode(', ', $extra));
+        }
+        foreach($options as $name=>$value) {
+            $this->$name=$value;
+        }
     }
 
     public function proxy(\Slim\Http\Request $slimRequest, \Slim\Http\Response $slimResponse):\Slim\Http\Response {
         //Forwards Slim Request to another server and returns the updated Slim Response.
+        //TBD whether this method should change urlencoded body if provided to JSON and change Content-Type header.
+        //TBD whether this method should change not send Slim request to Guzzle, but instead create a new Guzzle request and apply headers as applicable.
+        if($this->debug) $this->debugRequest($slimRequest, 'proxy() initial Slim');
         $body=$slimRequest->getBody();
-        if((string) $body && !$contentType=$slimRequest->getMediaType()) {
-            json_decode($slimRequest->getBody());
-            //Guzzle doesn't appear to like the full content type which includes: charset=utf-8
-            $contentType=json_last_error()?'application/x-www-form-urlencoded':'application/json';
+        if((string) $body) {
+            //For unknown reasons, Guzzle requires thatt the content type be reapplied
+            if(!$contentType=$slimRequest->getContentType()) {
+                json_decode($slimRequest->getBody());
+                $contentType=json_last_error()?'application/x-www-form-urlencoded;charset=utf-8':'application/json;charset=utf-8';
+                if($this->debug) syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to $contentType");
+            }
         }
+        $slimRequest=empty($contentType)?
+        $slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))  //Change slim's host to API server!
+        :$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))->withHeader('Content-Type', $contentType);  //And also apply Content-Type
+        if($this->debug) $this->debugRequest($slimRequest, 'proxy() final Slim');
 
-        $slimRequest=$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)));  //Change slim's host to API server!
         try {
-            /*
-            //If desired, can change body to JSON and change Content-Type
-            if (($contentType=$slimRequest->getMediaType()) && $contentType!=='application/json') {
-            //Change body to JSON if not currently done
-            $slimRequest->getBody()->write(json_encode($slimRequest->getParsedBody()));
-            $slimRequest->reparseBody();
-            $slimRequest=$slimRequest->withHeader('Content-Type', 'application/json;charset=utf-8');
-            $slimRequest->reparseBody();
-            syslog(LOG_INFO, 'string2: '.(string) $slimRequest->getBody());
-            }
-            Or maybe make a new guzzleRequest?
-            $guzzleRequest=(new \GuzzleHttp\Psr7\Request($slimRequest->getMethod(), $slimRequest->getUri()->getPath()))->withBody($slimRequest->getBody());
-            $headers=array_intersect_key($slimRequest->getHeaders(), array_flip(['CONTENT_LENGTH', 'CONTENT_TYPE']));
-            foreach($headers as $name=>$value) {
-            $guzzleRequest=$guzzleRequest->withHeader($this->getHeaderName($name), $value);
-            }
-            syslog(LOG_INFO, 'proxy $guzzleRequest->getHeaders(): '.json_encode($guzzleRequest->getHeaders()));
             $guzzleResponse=$this->httpClient->send($slimRequest);
-            */
-            $guzzleResponse=$this->httpClient->send(isset($contentType)?$slimRequest->withHeader('Content-Type', $contentType):$slimRequest);
+            if($this->debug) $this->debugResponse($guzzleResponse, 'proxy() Guzzle');
+            //Blacklist headers which should not be changed.  TBD whether I should whitelist headers instead.
             $excludedHeaders=['Date', 'Server', 'X-Powered-By', 'Access-Control-Allow-Origin', 'Access-Control-Allow-Methods', 'Access-Control-Allow-Headers'];
             $headerArrays=array_diff_key($guzzleResponse->getHeaders(), array_flip($excludedHeaders));
             foreach($headerArrays as $headerName=>$headers) {
@@ -52,22 +50,24 @@ class ServerBridge
                     $slimResponse=$slimResponse->withHeader($headerName, $headerValue);
                 }
             }
-            return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
+            $slimResponse=$slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
             if ($e->hasResponse()) {
                 $guzzleResponse=$e->getResponse();
                 if($this->isJson($guzzleResponse)) {
-                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
+                    $slimResponse=$slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
                 }
                 else {
-                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->write(json_encode(['message'=>(string)$guzzleResponse->getBody()]));
+                    $slimResponse=$slimResponse->withStatus($guzzleResponse->getStatusCode())->write(json_encode(['message'=>(string)$guzzleResponse->getBody()]));
                 }
             }
             else {
-                return $slimResponse->withStatus(500)->write(json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));
+                $slimResponse=$slimResponse->withStatus(500)->write(json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));
             }
         }
+        if($this->debug) $this->debugResponse($slimResponse, 'proxy() Slim');
+        return $slimResponse;
     }
 
     public function callApi(\GuzzleHttp\Psr7\Request $guzzleRequest, array $data=[]):\GuzzleHttp\Psr7\Response {
@@ -76,23 +76,36 @@ class ServerBridge
             $data=[in_array($guzzleRequest->getMethod(), ['GET','DELETE'])?'query':'json'=>$data];
         }
         try {
-            return $this->httpClient->send($guzzleRequest, $data);
+            if($this->debug) $this->debugRequest($guzzleRequest, 'callApi() Guzzle', $data);
+            $guzzleResponse=$this->httpClient->send($guzzleRequest, $data);
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
             if ($e->hasResponse()) {
                 $guzzleResponse=$e->getResponse();
-                if($this->isJson($guzzleResponse)) {
-                    return $guzzleResponse;
-                }
-                else {
-                    return $guzzleResponse->withBody(\GuzzleHttp\Psr7\stream_for(json_encode(['message'=>(string)$guzzleResponse->getBody()])));
+                if(!$this->isJson($guzzleResponse)) {
+                    $body=$guzzleResponse->getBody();
+                    $data=json_decode($body);
+                    if(json_last_error()) {
+                        if($this->debug) syslog(LOG_INFO, "ServerBridge::callApi() Content-Type not provided and changed to x-www-form-urlencoded");
+                        $guzzleResponse=$guzzleResponse
+                        ->withBody(\GuzzleHttp\Psr7\stream_for(json_encode(['message'=>(string)$body])))
+                        ->withHeader('Content-Type', 'application/x-www-form-urlencoded;charset=utf-8');
+                    }
+                    else {
+                        //Was JSON but just didn't have the header
+                        if($this->debug) syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to application/json");
+                        $guzzleResponse=$guzzleResponse->withHeader('Content-Type', 'application/json;charset=utf-8');
+                    }
                 }
             }
             else {
-                syslog(LOG_ERR, "ServerBridge::callApi() RequestException without response: {$this->getExceptionMessage($e)}");
-                return new \GuzzleHttp\Psr7\Response(500, [], json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));    //Untested
+                $excErr=$this->getExceptionMessage($e);
+                if($this->debug) syslog(LOG_ERR, "ServerBridge::callApi() RequestException without response: $excErr");
+                $guzzleResponse=new \GuzzleHttp\Psr7\Response(500, [], json_encode(['message'=>"RequestException without response: $excErr"]));    //Untested
             }
         }
+        if($this->debug) $this->debugResponse($guzzleResponse, 'callApi() Guzzle');
+        return $guzzleResponse;
     }
 
     public function getPageContent(array $pageItems):array {
@@ -157,7 +170,6 @@ class ServerBridge
     public function getConfigParam(array $path) {
         //$path=['elem1', 'elem2'] => returns $config[$elem1]['elem2]
         $config=$this->httpClient->getConfig();
-        $tmp=$this->config;
         foreach($path as $key) {
             if(!isset($config[$key])) {
                 throw new ServerBridgeException('Invalid path: '.implode('=>', $this->httpClient->getConfig()));
@@ -172,12 +184,59 @@ class ServerBridge
         return $includeSchema?$baseUri->getScheme().'://'.$baseUri->getHost():$baseUri->getHost();
     }
 
-    public function debug(\GuzzleHttp\Psr7\Response $response):array {
-        return [
-            'body'=>(string) $response->getBody(),
-            'status'=>$response->getStatusCode(),
-            'headers'=>$response->getHeaders()
+    private function debugRequest($psr7Request, string $label=null, array $data=[]) {
+        $label='ServerBridge Debug'.($label?" $label ":' ').'Request';
+        $arr=[
+            'method'=>$psr7Request->getMethod(),
+            'uri'=>(string) $psr7Request->getUri(),
+            'path'=>$psr7Request->getUri()->getPath(),
+            'query'=>$psr7Request->getUri()->getQuery(),
+            'headers'=>$psr7Request->getHeaders(),
+            'body'=>(string) $psr7Request->getBody(),
+            'data'=>$data
         ];
+        $this->debugLog($arr, $label);
+    }
+    private function debugResponse($psr7Response, string $label=null) {
+        $label='ServerBridge Debug'.($label?" $label ":' ').'Response';
+        $arr=[
+            'statusCode'=>$psr7Response->getStatusCode(),
+            'getReasonPhrase'=>$psr7Response->getReasonPhrase(),
+            'statusCode'=>$psr7Response->getStatusCode(),
+            'getProtocolVersion'=>$psr7Response->getProtocolVersion(),
+            'headers'=>$psr7Response->getHeaders(),
+            'body'=>(string) $psr7Response->getBody(),
+        ];
+        $this->debugLog($arr, $label);
+    }
+    private function debugLog(array $a, string $label) {
+        if($this->debugAsJson) {
+            if($a['body']) {
+                $body=json_decode($a['body']);
+                if(json_last_error()===0) {
+                    $a['body']=$body;
+                    $a['contentType']='application/json';
+                }
+                else {
+                    $a['body']=urldecode($a['body']);
+                    $a['contentType']='application/x-www-form-urlencoded';
+                }
+            }
+            else {
+                $a['contentType']=null;
+            }
+            $results=json_encode($a);
+            $results=str_replace('\\/','/',$results);
+            //$results=str_replace('\\"','"',$results);
+        }
+        else {
+            ob_start();
+            var_dump($a);
+            $results=ob_get_clean();
+        }
+        $results=$label.': '.$results;
+        syslog(LOG_INFO, $results);
+        return $results;
     }
 
     private function getHeaderName(string $name):string {
