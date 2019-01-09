@@ -46,20 +46,16 @@ class ServerBridge
         catch (\GuzzleHttp\Exception\RequestException  $e) {
             if ($e->hasResponse()) {
                 $guzzleResponse=$e->getResponse();
-                if($this->isJson($guzzleResponse)) {
-                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
-                }
-                else {
-                    return $slimResponse->withStatus($guzzleResponse->getStatusCode())->write(json_encode(['message'=>(string)$guzzleResponse->getBody()]));
-                }
+                return $slimResponse->withStatus($guzzleResponse->getStatusCode())->withBody($guzzleResponse->getBody());
             }
             else {
-                return $slimResponse->withStatus(500)->write(json_encode(['message'=>"RequestException without response: {$this->getExceptionMessage($e)}"]));
+                return $slimResponse->withStatus(500)->write($this->getNonResponseErrorJson($e));
             }
         }
     }
 
-    public function request(string $method, string $path, array $data=[]):\GuzzleHttp\Psr7\Response {
+    public function proxyRequest(string $method, string $path, array $data=[]):\GuzzleHttp\Psr7\Response {
+        //Submits a single Guzzle Request and returns the Guzzle Response.
         if($data) {
             $data=[in_array(strtoupper($method), ['GET','DELETE'])?'query':'json'=>$data];
         }
@@ -67,21 +63,49 @@ class ServerBridge
             return $this->httpClient->send(new \GuzzleHttp\Psr7\Request($method, $path), $data);
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
-            return $this->httpClient->processGuzzleException($e);
+            return $e->hasResponse()
+            ?$e->getResponse():
+            new \GuzzleHttp\Psr7\Response(500, [], $this->getNonResponseErrorJson($e)); //untested
         }
     }
 
-    public function callApi(\GuzzleHttp\Psr7\Request $guzzleRequest, array $data=[]):\GuzzleHttp\Psr7\Response {
-        //Submits a single Guzzle Request and returns the Guzzle Response.
+    public function callApi(string $method, string $path, array $data=[]) {
+        //Submits a single Guzzle Request and returns the data, and throws an exception if not 2xx.
+        //Will return stdObject or sequential array.
         if($data) {
-            $data=[in_array($guzzleRequest->getMethod(), ['GET','DELETE'])?'query':'json'=>$data];
+            $data=[in_array(strtoupper($method), ['GET','DELETE'])?'query':'json'=>$data];
         }
         try {
-            return $this->httpClient->send($guzzleRequest, $data);
+            $body=$this->httpClient->send(new \GuzzleHttp\Psr7\Request($method, $path), $data)->getBody();
+            $rs=json_decode($body);
+            return json_last_error()?(string)$body:$rs;
         }
         catch (\GuzzleHttp\Exception\RequestException  $e) {
-            return $this->httpClient->processGuzzleException($e);
+            if ($e->hasResponse()) {
+                $guzzleResponse=$e->getResponse();
+                $message=$this->getMessage($guzzleResponse->getBody());
+                throw new ServerBridgeException($message, $guzzleResponse->getStatusCode(), $e);
+            }
+            else {
+                throw new ServerBridgeException($e->getMessage(), 500, $e);
+            }
         }
+    }
+
+    private function getNonResponseErrorJson(\Exception $e):string {
+        return json_encode(['message'=>'RequestException without response: '.$this->getExceptionMessage($e)]);
+    }
+
+    private function getMessage(\GuzzleHttp\Psr7\Stream $body, $asArray=true) {
+        //Returns message as a string if possible, else as an array (or JSON string if $asArray is false)
+        $data=json_decode($body, true);
+        if(json_last_error()) {
+            return (string)$body;
+        }
+        elseif(count($data)===1 && ($error=array_intersect_key($data,array_flip(['message','error','errors']))) && is_string($msg = reset($data)) ) {
+            return $msg;
+        }
+        return $asArray?$data:json_encode($data);   //return array or json string
     }
 
     public function getPageContent(array $requests, string $pathPrefix=''):array {
@@ -111,19 +135,20 @@ class ServerBridge
                 $requests[$label]=json_decode($response->getBody(), $returnAsArray);
             }
             catch (\GuzzleHttp\Exception\RequestException  $e) {
-                $response=$this->processGuzzleException($e);
                 $requests[$label]=$defaultResults;
-                $requests['errors'][$label]=json_decode($response->getBody())->message??'UnknownError';
+                $requests['errors'][$label]=$e->hasResponse()
+                ?$this->getMessage($e->getResponse()->getBody(), false)
+                :$e->getMessage();
             }
         }
         return $requests;
     }
 
     public function getMimeType(string $type):string {
-        if(empty($type)) throw new ServerBridgeException("Missing Accept value.");
+        if(empty($type)) throw new ServerBridgeUncatchableException("Missing Accept value.");
         $a=array_merge($this->standardMimeTypes, $this->customMimeTypes);
         if(!isset($a[$type]))
-            throw new ServerBridgeException("Invalid Accept value: $type");
+            throw new ServerBridgeUncatchableException("Invalid Accept value: $type");
         return $a[$type];
     }
 
@@ -136,7 +161,7 @@ class ServerBridge
         $config=$this->httpClient->getConfig();
         foreach($path as $key) {
             if(!isset($config[$key])) {
-                throw new ServerBridgeException('Invalid path: '.implode('=>', $this->httpClient->getConfig()));
+                throw new ServerBridgeUncatchableException('Invalid path: '.implode('=>', $this->httpClient->getConfig()));
             }
             $config=$config[$key];
         }
@@ -149,6 +174,7 @@ class ServerBridge
     }
 
     private function processGuzzleException(\GuzzleHttp\Exception\RequestException $e):\GuzzleHttp\Psr7\Response {
+        //Not used
         if ($e->hasResponse()) {
             $guzzleResponse=$e->getResponse();
             if(!$this->isJson($guzzleResponse)) {
