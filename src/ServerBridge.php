@@ -1,4 +1,5 @@
 <?php
+
 namespace Greenbean\ServerBridge;
 class ServerBridge
 {
