@@ -19,20 +19,61 @@ class ServerBridge
         //Forwards Slim Request to another server and returns the updated Slim Response.
         //TBD whether this method should change urlencoded body if provided to JSON and change Content-Type header.
         //TBD whether this method should change not send Slim request to Guzzle, but instead create a new Guzzle request and apply headers as applicable.
-        $body=$slimRequest->getBody();
-        if((string) $body) {
-            //For unknown reasons, Guzzle requires thatt the content type be reapplied
-            if(!$contentType=$slimRequest->getContentType()) {
-                json_decode($slimRequest->getBody());
-                $contentType=json_last_error()?'application/x-www-form-urlencoded;charset=utf-8':'application/json;charset=utf-8';
-                syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to $contentType");
-            }
-        }
-        $slimRequest=empty($contentType)?
-        $slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))  //Change slim's host to API server!
-        :$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))->withHeader('Content-Type', $contentType);  //And also apply Content-Type
+        $contentType=$slimRequest->getContentType();
         try {
-            $guzzleResponse=$this->httpClient->send($slimRequest);
+            if(substr($contentType, 0, 19)==='multipart/form-data'){
+                //Support uploading a file.
+                $options=[];
+                $files = $slimRequest->getUploadedFiles();
+                $multiparts=[];
+                $errors=[];
+                foreach($files as $name=>$file) {
+                    if ($error=$file->getError()) {
+                        $errors[]=[
+                            'name'=> $name,
+                            'filename'=> $file->getClientFilename(),
+                            'error' => $this->getFileErrorMessage($error)
+                        ];
+                    }
+                    else {
+                        $multiparts[]=[
+                            'name'=> $name,
+                            'filename'=> $file->getClientFilename(),
+                            'contents' => $file->getStream(),
+                            'headers'  => [
+                                //'Size' => $file->getSize(),   //Not needed, right?
+                                'Content-Type' => $file->getClientMediaType()
+                            ]
+                        ];
+                    }
+                }
+                if($errors) {
+                    return $slimResponse->withJson(['message'=>implode(', ', $errors)], 422);
+                }
+                $multiparts[]=[
+                    'name'=> 'data',
+                    'contents' => json_encode($slimRequest->getParsedBody()),
+                    'headers'  => ['Content-Type' => 'application/json']
+                ];
+                $options['multipart']=$multiparts;
+
+                $guzzleResponse = $this->httpClient->request($slimRequest->getMethod(), $slimRequest->getUri()->getPath(), $options);
+            }
+            else {
+                $body=$slimRequest->getBody();
+                if((string) $body) {
+                    //For unknown reasons, Guzzle requires thatt the content type be reapplied
+                    if(!$contentType) {
+                        json_decode($slimRequest->getBody());
+                        $contentType=json_last_error()?'application/x-www-form-urlencoded;charset=utf-8':'application/json;charset=utf-8';
+                        syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to $contentType");
+                    }
+                }
+                $slimRequest=empty($contentType)?
+                $slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))  //Change slim's host to API server!
+                :$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))->withHeader('Content-Type', $contentType);  //And also apply Content-Type
+                $guzzleResponse=$this->httpClient->send($slimRequest);
+            }
             //Blacklist headers which should not be changed.  TBD whether I should whitelist headers instead.
             $excludedHeaders=['Date', 'Server', 'X-Powered-By', 'Access-Control-Allow-Origin', 'Access-Control-Allow-Methods', 'Access-Control-Allow-Headers'];
             $headerArrays=array_diff_key($guzzleResponse->getHeaders(), array_flip($excludedHeaders));
@@ -53,6 +94,7 @@ class ServerBridge
             }
         }
     }
+
 
     //Not currently used.
     private function getHeaders(\Slim\Http\Request $slimRequest):array
