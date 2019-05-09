@@ -25,13 +25,12 @@ class ServerBridge
             if(!$contentType=$slimRequest->getContentType()) {
                 json_decode($slimRequest->getBody());
                 $contentType=json_last_error()?'application/x-www-form-urlencoded;charset=utf-8':'application/json;charset=utf-8';
-                assert(syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to $contentType"));
+                syslog(LOG_INFO, "ServerBridge::proxy() Content-Type not provided and changed to $contentType");
             }
         }
         $slimRequest=empty($contentType)?
         $slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))  //Change slim's host to API server!
         :$slimRequest->withUri($slimRequest->getUri()->withHost($this->getHost(false)))->withHeader('Content-Type', $contentType);  //And also apply Content-Type
-
         try {
             $guzzleResponse=$this->httpClient->send($slimRequest);
             //Blacklist headers which should not be changed.  TBD whether I should whitelist headers instead.
@@ -55,6 +54,11 @@ class ServerBridge
         }
     }
 
+    //Not currently used.
+    private function getHeaders(\Slim\Http\Request $slimRequest):array
+    {
+        return array_intersect_key($slimRequest->getHeaders(), array_flip(["HTTP_CONNECTION", "CONTENT_LENGTH", "HTTP_ACCEPT", "HTTP_ACCEPT_ENCODING", "HTTP_ACCEPT_LANGUAGE"]));   // "CONTENT_TYPE"
+    }
     public function proxyRequest(string $method, string $path, array $data=[]):\GuzzleHttp\Psr7\Response {
         //Submits a single Guzzle Request and returns the Guzzle Response.
         if($data) {
@@ -100,6 +104,10 @@ class ServerBridge
     private function getMessage(\GuzzleHttp\Psr7\Stream $body, $asArray=true) {
         //Returns message as a string if possible, else as an array (or JSON string if $asArray is false)
         $data=json_decode($body, true);
+        if(!$data) {
+            syslog(LOG_ERR, 'Fix ServerBridge::getMessage()');
+            $data=[];
+        }
         if(json_last_error()) {
             return (string)$body;
         }
